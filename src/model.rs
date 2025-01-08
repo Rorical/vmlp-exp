@@ -156,8 +156,15 @@ pub struct DBMLP {
 
 impl DBMLP {
     pub fn new(mlp: MLP) -> Self {
-        let mut db = VectorDatabase::new(mlp.w1.ncols(), 256);
-        let keys = mlp.w1.to_owned();
+        let mut db = VectorDatabase::new(mlp.w1.ncols(), 128);
+        let mut keys = mlp.w1.to_owned();
+        for mut row in keys.outer_iter_mut() {
+            let norm_squared: f64 = row.iter().map(|x| x * x).sum();
+            if norm_squared > 0.0 {
+                let norm = norm_squared.sqrt();
+                row.mapv_inplace(|x| x / norm);
+            }
+        }
         db.train(&keys);
         let values: Vec<_> = (0..mlp.w2.ncols()).map(|i| mlp.w2.column(i).to_owned()).collect();
         db.add(&keys, &values);
@@ -166,7 +173,7 @@ impl DBMLP {
 
     pub fn predict_batch(&self, x_batch: &Array2<f64>) -> Vec<usize> {
         let start = Instant::now();
-        let results = self.db.search_conditional(x_batch, 0.0, -0.001);
+        let results = self.db.search_conditional(x_batch, 0.0, -0.01);
         println!("DB Search took: {:?}", start.elapsed());
 
         results.iter().map(|query_results| {

@@ -16,3 +16,6 @@ linfa = { version = "0.7.0", features = ["serde"] }
 linfa-clustering = { version = "0.7.0", features = ["serde"] }
 approx = "0.5.1"
 rand_distr = "0.4.3"
+plotters = "0.3.7"
+ndarray-stats = "0.6.0"
+ordered-float = "4.6.0"

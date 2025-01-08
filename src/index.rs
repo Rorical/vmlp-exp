@@ -6,6 +6,10 @@ use rayon::prelude::*;
 use std::time::Instant;
 use std::{collections::HashMap, hash::Hash};
 use crate::kmeans::KMeans;
+use ndarray::{ArrayView1};
+use std::collections::{HashSet};
+use priority_queue::PriorityQueue;
+use ordered_float::OrderedFloat;
 
 pub struct ProductQuantizer {
     sub_vector_dim: usize,
@@ -137,8 +141,9 @@ impl IVFPQIndex {
 
     pub fn train(&mut self, data: &Array2<f64>) {
         // Perform k-means clustering using our custom implementation
-        let mut kmeans = KMeans::new(self.n_cells, 200);
+        let mut kmeans = KMeans::new(self.n_cells, 1000);
         kmeans.fit(data);
+        kmeans.visualize(data, "kmeans.png").unwrap();
         self.centroids = kmeans.centroids().to_owned();
 
         // Initialize inverted lists
@@ -254,7 +259,7 @@ impl IVFPQIndex {
         let n_queries = queries.nrows();
 
         // Process each query's scores
-        (0..n_queries)
+        let results = (0..n_queries)
             .into_par_iter()
             .map(|query_idx| {
                 let centroids_query_ids: Vec<_> = scores_matrix.row(query_idx)
@@ -264,28 +269,48 @@ impl IVFPQIndex {
 
                 let query = queries.slice(s![query_idx, ..]);
                 let mut query_results: Vec<(usize, f64)> = Vec::new();
+                
+                let mut cells_searched = 0;
+                let mut total_valid_items = 0;
+                let mut total_items = 0;
 
                 // Iterate through centroids in order of similarity
                 for (cell_id, &cell_score) in centroids_query_ids {
                     if cell_score < meta_threshold {
                         continue;
                     }
+                    cells_searched += 1;
+                    
                     if let Some(cell) = self.inverted_index.get(&cell_id) {
                         // Compute dot products with all vectors in this cell
                         let scores = cell.vectors.dot(&query.view());
+                        total_items += scores.len();
                         
                         // Add vectors that exceed threshold
-                        scores.iter()
+                        let valid_items = scores.iter()
                             .enumerate()
                             .filter(|(_, &score)| score > threshold)
-                            .for_each(|(i, &score)| {
+                            .map(|(i, &score)| {
                                 query_results.push((cell.vector_ids[i], score));
-                            });
+                                1
+                            })
+                            .sum::<usize>();
+                            
+                        total_valid_items += valid_items;
                     }
                 }
+
+                println!("Query {}: Searched {} cells, average {:.2} valid items per cell, average {:.2} total items per cell", 
+                    query_idx, cells_searched, 
+                    if cells_searched > 0 { total_valid_items as f64 / cells_searched as f64 } else { 0.0 },
+                    if cells_searched > 0 { total_items as f64 / cells_searched as f64 } else { 0.0 }
+                );
+
                 query_results
             })
-            .collect()
+            .collect();
+
+        results
     }
 }
 
@@ -347,6 +372,227 @@ impl<T: Clone> VectorDatabase<T> {
             })
             .collect()
     }
+}
+
+pub struct HNSWIndex {
+    nodes: Vec<Node>,
+    entry_point: Option<usize>,
+    ef_construction: usize,
+    max_m: usize,
+    max_m0: usize,
+    max_level: usize,
+    level_mult: f64,
+}
+
+struct Node {
+    vector: Array1<f64>,
+    neighbors: Vec<Vec<usize>>,  // Vec of neighbors for each layer
+    level: usize,
+}
+
+impl HNSWIndex {
+    pub fn new(ef_construction: usize, max_m: usize) -> Self {
+        Self {
+            nodes: Vec::new(),
+            entry_point: None,
+            ef_construction: ef_construction.max(max_m),
+            max_m,
+            max_m0: 2 * max_m,
+            max_level: 6,
+            level_mult: 1.0/ln(max_m as f64),
+        }
+    }
+
+    fn get_random_level(&self) -> usize {
+        let mut rng = rand::thread_rng();
+        let r: f64 = rng.gen();
+        (-r * self.level_mult).floor() as usize
+    }
+
+    pub fn add(&mut self, vector: Array1<f64>) {
+        let id = self.nodes.len();
+        let level = self.get_random_level().min(self.max_level);
+        
+        // Initialize new node
+        let mut node = Node {
+            vector,
+            neighbors: vec![Vec::new(); level + 1],
+            level,
+        };
+
+        // If this is the first node
+        if self.entry_point.is_none() {
+            self.nodes.push(node);
+            self.entry_point = Some(0);
+            return;
+        }
+
+        let mut curr_ep = self.entry_point.unwrap();
+        
+        // Search from top to bottom layer
+        for l in (1..=level).rev() {
+            let candidates = self.search_layer(node.vector.view(), curr_ep, self.ef_construction, l);
+            curr_ep = self.connect_new_element(&mut node, candidates.into_iter().map(|(id, _)| id).collect(), l);
+        }
+
+        // Ground layer (l=0) has more connections
+        let candidates = self.search_layer(node.vector.view(), curr_ep, self.ef_construction, 0);
+        self.connect_new_element(&mut node, candidates.into_iter().map(|(id, _)| id).collect(), 0);
+
+        // Update entry point if needed
+        if level > self.nodes[self.entry_point.unwrap()].level {
+            self.entry_point = Some(id);
+        }
+
+        self.nodes.push(node);
+    }
+
+    fn search_layer_conditional(&self, query: ArrayView1<f64>, entry_point: usize, level: usize, threshold: f64) -> Vec<(usize, f64)> {
+        let mut visited = HashSet::new();
+        let mut candidates = PriorityQueue::new();
+        let mut results = Vec::new();
+        
+        let dist = cosine_similarity(&self.nodes[entry_point].vector, &query.to_owned());
+        candidates.push(entry_point, OrderedFloat(dist));
+        if dist > threshold {
+            results.push((entry_point, dist));
+        }
+        visited.insert(entry_point);
+        let mut total_neighbors = 0;
+        let mut accepted_neighbors = 0;
+
+        while !candidates.is_empty() {
+            let (curr, _) = candidates.pop().unwrap();
+            
+            // Check neighbors at this level
+            for &neighbor in &self.nodes[curr].neighbors[level] {
+                if !visited.insert(neighbor) {
+                    continue;
+                }
+                total_neighbors += 1;
+
+                let dist = cosine_similarity(&self.nodes[neighbor].vector, &query.to_owned());
+                // Add to results only if above threshold
+                if dist > threshold {
+                    if rand::random::<f64>() < 0.05 {
+                        candidates.push(neighbor, OrderedFloat(dist));
+                    }
+                    results.push((neighbor, dist));
+                    accepted_neighbors += 1;
+                }
+            }
+        }
+
+        println!("Total neighbors checked: {}", total_neighbors);
+        println!("Neighbors accepted: {}", accepted_neighbors);
+
+        results
+    }
+
+    fn search_layer(&self, query: ArrayView1<f64>, entry_point: usize, ef: usize, level: usize) -> Vec<(usize, f64)> {
+        let mut visited = HashSet::new();
+        let mut candidates = PriorityQueue::new();
+        let mut results = HashMap::new();
+        let mut result_queue = PriorityQueue::new();
+        
+        let dist = cosine_similarity(&self.nodes[entry_point].vector, &query.to_owned());
+        candidates.push(entry_point, OrderedFloat(dist));
+        result_queue.push(entry_point, OrderedFloat(dist));
+        results.insert(entry_point, dist);
+        visited.insert(entry_point);
+
+        while !candidates.is_empty() {
+            let (curr, _) = candidates.pop().unwrap();
+            
+            // Check neighbors at this level
+            for &neighbor in &self.nodes[curr].neighbors[level] {
+                if !visited.insert(neighbor) {
+                    continue;
+                }
+
+                let dist = cosine_similarity(&self.nodes[neighbor].vector, &query.to_owned());
+                let worst_dist = result_queue.peek().map(|(_, d)| d.0).unwrap_or(f64::NEG_INFINITY);
+                
+                if result_queue.len() < ef || dist > worst_dist {
+                    candidates.push(neighbor, OrderedFloat(dist));
+                    result_queue.push(neighbor, OrderedFloat(dist));
+                    results.insert(neighbor, dist);
+                    if result_queue.len() > ef {
+                        if let Some((removed_id, _)) = result_queue.pop() {
+                            results.remove(&removed_id);
+                        }
+                    }
+                }
+            }
+        }
+
+        result_queue.into_sorted_vec()
+        .into_iter()
+        .map(|id| (id, results[&id]))
+        .collect()
+    }
+
+    fn connect_new_element(&mut self, node: &mut Node, candidates: Vec<usize>, level: usize) -> usize {
+        let max_connections = if level == 0 { self.max_m0 } else { self.max_m };
+        let best_candidates: Vec<usize> = candidates.into_iter()
+            .take(max_connections)
+            .collect();
+
+        // Add bidirectional connections
+        for &candidate_id in &best_candidates {
+            node.neighbors[level].push(candidate_id);
+            let len = self.nodes.len();
+            self.nodes[candidate_id].neighbors[level].push(len);
+        }
+
+        best_candidates[0]
+    }
+
+    pub fn search(&self, query: &Array1<f64>, k: usize) -> Vec<(usize, f64)> {
+        if let Some(ep) = self.entry_point {
+            let mut curr_ep = ep;
+            let mut curr_level = self.nodes[ep].level;
+
+            // Traverse from top to level 1
+            while curr_level > 0 {
+                let candidates = self.search_layer(query.view(), curr_ep, self.max_m, curr_level);
+                curr_ep = candidates[0].0;
+                curr_level -= 1;
+            }
+
+            // Search ground layer with ef = max(k, ef_construction)
+            self.search_layer(query.view(), curr_ep, k, 0)
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub fn search_conditional(&self, query: &Array1<f64>, threshold: f64) -> Vec<(usize, f64)> {
+        if let Some(ep) = self.entry_point {
+            let mut curr_ep = ep;
+            let mut curr_level = self.nodes[ep].level;
+
+            // Traverse from top to level 1
+            while curr_level > 0 {
+                let candidates = self.search_layer(query.view(), curr_ep, self.max_m, curr_level);
+                curr_ep = candidates[0].0;
+                curr_level -= 1;
+            }
+
+            self.search_layer_conditional(query.view(), curr_ep, 0, threshold)
+        } else {
+            Vec::new()
+        }
+    }
+}
+
+fn cosine_similarity(a: &Array1<f64>, b: &Array1<f64>) -> f64 {
+    let prod = a.dot(b);
+    prod
+}
+
+fn ln(x: f64) -> f64 {
+    x.ln()
 }
 
 #[cfg(test)]
@@ -656,5 +902,148 @@ mod tests {
 
             println!("{:?}", result_set);
         }
+    }
+
+    #[test]
+    fn test_hnsw() {
+        let mut rng = rand::thread_rng();
+        let n_vectors = 1000;
+        let dim = 128;
+        let k = 5;
+
+        // Create random vectors for testing
+        let vectors: Vec<Array1<f64>> = (0..n_vectors)
+            .map(|_| Array1::from_shape_fn(dim, |_| rng.gen::<f64>()))
+            .collect();
+
+        // Initialize HNSW index
+        let mut hnsw = HNSWIndex::new(128, 16); // ef_construction=128, max_m=16
+
+        // Add vectors to index
+        for vector in &vectors {
+            hnsw.add(vector.clone());
+        }
+
+        // Create query vectors
+        let n_queries = 10;
+        let queries: Vec<Array1<f64>> = (0..n_queries)
+            .map(|_| Array1::from_shape_fn(dim, |_| rng.gen::<f64>()))
+            .collect();
+
+        // Perform search
+        for query in &queries {
+            let results = hnsw.search(query, k);
+            println!("{:?}", results);
+            // Basic validation
+            assert!(
+                results.len() <= k,
+                "Should return at most k results per query"
+            );
+
+            // Verify results by computing actual distances
+            let mut actual_distances: Vec<(usize, f64)> = vectors
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (i, cosine_similarity(v, query)))
+                .collect();
+            actual_distances.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            let top_k_actual: HashSet<_> = actual_distances.iter().take(k * 2).map(|(i, _)| i).collect();
+            println!("{:?}", actual_distances.iter().take(k * 2).collect::<Vec<_>>());
+            // Check if HNSW results are in top-2k of actual nearest neighbors
+            // (allowing some approximation error)
+            for &idx in &results {
+                assert!(
+                    top_k_actual.contains(&idx.0),
+                    "HNSW results should be among top-2k actual nearest neighbors"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_conditional_search() {
+        let mut rng = rand::thread_rng();
+        let dim = 128;
+        let n_vectors = 1024;
+
+        // Create random vectors for testing with both positive and negative values
+        let vectors: Vec<Array1<f64>> = (0..n_vectors)
+            .map(|_| Array1::from_shape_fn(dim, |_| rng.gen::<f64>() * 2.0 - 1.0))
+            .collect();
+
+        // Initialize HNSW index
+        let mut hnsw = HNSWIndex::new(320, 16); // ef_construction=128, max_m=16
+
+        // Add vectors to index
+        for vector in &vectors {
+            hnsw.add(vector.clone());
+        }
+
+        // Create query vectors
+        let n_queries = 10;
+        let queries: Vec<Array1<f64>> = (0..n_queries)
+            .map(|_| Array1::from_shape_fn(dim, |_| rng.gen::<f64>()))
+            .collect();
+
+        // Test threshold search
+        let threshold = 0.4;
+        let mut hnsw_total_time = std::time::Duration::new(0, 0);
+        let mut ground_truth_total_time = std::time::Duration::new(0, 0);
+
+        for query in &queries {
+            // Time HNSW search
+            let hnsw_start = std::time::Instant::now();
+            let results = hnsw.search_conditional(query, threshold);
+            hnsw_total_time += hnsw_start.elapsed();
+            
+            // Time ground truth calculation
+            let ground_truth_start = std::time::Instant::now();
+            let ground_truth: Vec<(usize, f64)> = vectors
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (i, cosine_similarity(v, query)))
+                .filter(|(_, sim)| *sim > threshold)
+                .collect();
+            ground_truth_total_time += ground_truth_start.elapsed();
+
+            // Sort both results and ground truth by similarity for comparison
+            let mut results_sorted = results.clone();
+            let mut ground_truth_sorted = ground_truth.clone();
+            results_sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            ground_truth_sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+            // Convert to sets for comparison
+            let result_set: HashSet<_> = results.into_iter().map(|(idx, _)| idx).collect();
+            let ground_truth_set: HashSet<_> = ground_truth.into_iter().map(|(idx, _)| idx).collect();
+
+            // Verify all found results have similarity > threshold
+            for &(idx, sim) in &results_sorted {
+                assert!(
+                    sim > threshold,
+                    "All results should have similarity greater than threshold"
+                );
+                assert!(
+                    ground_truth_set.contains(&idx),
+                    "All HNSW results should be in ground truth"
+                );
+            }
+
+            // Print stats
+            println!(
+                "Query results: found {}/{} vectors above threshold", 
+                result_set.len(), 
+                ground_truth_set.len()
+            );
+        }
+
+        // Print timing stats
+        println!(
+            "Average HNSW search time: {:?}", 
+            hnsw_total_time / n_queries as u32
+        );
+        println!(
+            "Average ground truth calculation time: {:?}",
+            ground_truth_total_time / n_queries as u32
+        );
     }
 }
